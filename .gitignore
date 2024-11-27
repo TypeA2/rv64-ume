@@ -3,3 +3,4 @@ ref/
 
 *.o
 rv64-ume
+*.S
