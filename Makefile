@@ -8,14 +8,8 @@ CXX = g++
 CXXFLAGS = -std=c++20 -Wall -Wextra -Wpedantic -g -O0 \
 	-Wno-unused-parameter -Wno-unused-function
 
-OBJECTS = \
-	main.o \
-	elf_file.o \
-	helpers.o
-
-HEADERS = \
-	arch.h \
-	elf_file.h
+OBJECTS = main.o elf_file.o helpers.o
+HEADERS = elf_file.h
 
 all: rv64-ume
 
