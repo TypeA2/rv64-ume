@@ -4,6 +4,8 @@
 #include <map>
 #include <string_view>
 
+#include <cstdint>
+
 #include <signal.h>
 
 /* From rv64-emu */
