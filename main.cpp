@@ -11,155 +11,34 @@
 #include <csetjmp>
 #include <chrono>
 #include <map>
+#include <thread>
+#include <functional>
+#include <csignal>
 
 #include <getopt.h>
 #include <elf.h>
 #include <unistd.h>
-#include <signal.h>
 
 #include "elf_file.h"
+#include "util.h"
+
+#ifdef ENABLE_FRAMEBUFFER
+#include "framebuffer.h"
+#endif
 
 #if !defined(__riscv) || __riscv_xlen != 64
 # error "Can only run on RV64"
 #endif
-
-/* From rv64-emu */
-enum ExitCodes : int {
-    Success = 0,
-    AbnormalTermination = 1,
-    HelpDisplayed = 2,
-    InitializationError = 3,
-    UnitTestFailed = 5,
-    NotSupported = 6,
-    SigHandlerFailure = 7
-};
-
-std::map<std::string_view, uint8_t> reg_name_map {
-    { "ra",   1 }, { "x1",   1 },
-    { "sp",   2 }, { "x2",   2 },
-    { "gp",   3 }, { "x3",   3 },
-    { "tp",   4 }, { "x4",   4 }, 
-    { "t0",   5 }, { "x5",   5 },
-    { "t1",   6 }, { "x6",   6 },
-    { "t2",   7 }, { "x7",   7 },
-    { "s0",   8 }, { "x8",   8 }, { "fp", 8 },
-    { "s1",   9 }, { "x9",   9 },
-    { "a0",  10 }, { "x10", 10 },
-    { "a1",  11 }, { "x11", 11 },
-    { "a2",  12 }, { "x12", 12 }, 
-    { "a3",  13 }, { "x13", 13 },
-    { "a4",  14 }, { "x14", 14 },
-    { "a5",  15 }, { "x15", 15 },
-    { "a6",  16 }, { "x16", 16 }, 
-    { "a7",  17 }, { "x17", 17 },
-    { "s2",  18 }, { "x18", 18 },
-    { "s3",  19 }, { "x19", 19 },
-    { "s4",  20 }, { "x20", 20 }, 
-    { "s5",  21 }, { "x21", 21 },
-    { "s6",  22 }, { "x22", 22 },
-    { "s7",  23 }, { "x23", 23 },
-    { "s8",  24 }, { "x24", 24 }, 
-    { "s9",  25 }, { "x25", 25 },
-    { "s10", 26 }, { "x26", 26 },
-    { "s11", 27 }, { "x27", 27 },
-    { "t3",  28 }, { "x28", 28 }, 
-    { "t4",  29 }, { "x29", 29 },
-    { "t5",  30 }, { "x30", 30 }, 
-    { "t6",  31 }, { "x31", 31 },
-};
-
-/* Can't use reg_name_map because this should be signal-safe(-ish) */
-static constexpr const char* regnames[NGREG] {
-    " pc", " ra", " sp", " gp", " tp", " t0", " t1", " t2",
-    " fp", " s1", " a0", " a1", " a2", " a3", " a4", " a5",
-    " a6", " a7", " s2", " s3", " s4", " s5", " s6", " s7",
-    " s8", " s9", "s10", "s11", " t3", " t4", " t5", " t6"
-};
-
-using reg_val = uint64_t;
-using reg_num = uint8_t;
-
-static constexpr reg_num NUM_REGS = 32;
-
-static constexpr uint32_t TEST_END_MARKER = 0xddffccff;
-
-enum ExitTypes : int {
-    InitialCall  = 0,
-    ExitByStatus = 1,
-    ExitByMarker = 2,
-};
-
-struct reg_init {
-    reg_num num;
-    reg_val val;
-
-    reg_init(reg_num num, reg_val val) : num { num }, val { val } {
-        if (num >= NGREG) {
-            throw std::out_of_range("Register " + std::to_string(static_cast<int>(num)) + " is out of range");
-        }
-    }
-
-    reg_init(std::string_view init) {
-        size_t delim = init.find("=");
-        if (delim == std::string::npos) {
-            throw std::invalid_argument("Error: Invalid string format for initstr " + std::string{init});
-        }
-
-        std::string reg { init.substr(0, delim) };
-        std::string val { init.substr(delim + 1) };
-
-        this->num = (reg.front() == 'R') ? std::stoi(reg.substr(1)) : reg_name_map.at(reg);
-        this->val = std::stoull(val.c_str(), nullptr, 0);
-        
-        if (num >= NGREG) {
-            throw std::out_of_range("Register " + std::to_string(static_cast<int>(num)) + " is out of range");
-        }
-    }
-};
-
-static void crash_and_burn(const char* msg) {
-    size_t chars = 0;
-    const char* cur = msg;
-    while (*cur++) ++chars;
-
-    /* write isn't checked because if it fails we're screwed anyway */
-    write(STDOUT_FILENO, msg, chars);
-    if (msg[chars-1] != '\n') write(STDOUT_FILENO, "\n", 1);
-    _exit(ExitCodes::SigHandlerFailure);
-}
-
-static void dump_regs(__riscv_mc_gp_state regs) {
-    /* Holds at most a hex 64-bit integer, plus null terminator */
-    char buf[16 + 1];
-    int res = 0;
-
-    for (size_t i = 0; i < 16; ++i) {
-        /* Write regname and = */
-        write(STDOUT_FILENO, regnames[i], 3);
-        write(STDOUT_FILENO, "=", 1);
-
-        res = snprintf(buf, sizeof(buf), "%.16" PRIx64, regs[i]);
-        if (res < 0) crash_and_burn("snprintf fail (1)");
-        write(STDOUT_FILENO, buf, res);
-
-        write(STDOUT_FILENO, "  ", 2);
-
-        write(STDOUT_FILENO, regnames[i + 16], 3);
-        write(STDOUT_FILENO, "=", 1);
-
-        res = snprintf(buf, sizeof(buf), "%.16" PRIx64, regs[i + 16]);
-        if (res < 0) crash_and_burn("snprintf fail (2)");
-        write(STDOUT_FILENO, buf, res);
-
-        write(STDOUT_FILENO, "\n", 1);
-    }
-}
 
 static __riscv_mc_gp_state g_init_regs;
 static __riscv_mc_gp_state g_result_regs;
 extern "C" {
     jmp_buf g_jmp_buf;
 }
+
+#ifdef ENABLE_FRAMEBUFFER
+static Framebuffer g_framebuffer;
+#endif
 
 extern "C" [[noreturn]] void safe_exit();
 extern "C" void restore_regs();
@@ -199,8 +78,9 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
 
         bool is_compressed = (opcode & 0b11) != 0b11;
 
-        uint64_t written_value = 0;
-        uint8_t write_width = 0;
+        uint64_t value = 0;
+        uint8_t width = 0;
+        bool is_write = false;
         if (is_compressed) {
             if ((opcode & 0b11) == 0b00) {
                 /* Quadrant 0 */
@@ -209,35 +89,73 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
                 uint8_t funct3 = (instr >> 13) & 0b111;
 
                 /* c.sd or c.sw */
-                if (funct3 != 0b111 && funct3 != 0b110) crash_and_burn("unsupported quadrant 0 instruction");
+                switch (funct3) {
+                    case 0b111: is_write = true;  width = 8; break;
+                    case 0b110: is_write = true;  width = 4; break;
+                    case 0b011: is_write = false; width = 8; break;
+                    case 0b010: is_write = false; width = 4; break;
 
-                write_width = (funct3 == 0b111) ? 8 : 4;
+                    default: {
+                        char msg[160];
+                        sprintf(msg, "unsupported quadrant 0 instruction at %p: %x", pc_ptr, instr);
+                        crash_and_burn(msg);
+                    }
+                }
 
-                written_value = ctx->uc_mcontext.__gregs[8 + ((instr >> 2) & 0b111)];
+                if (is_write) {
+                    value = ctx->uc_mcontext.__gregs[8 + ((instr >> 2) & 0b111)];
+                } else {
+                    value = 8 + ((instr >> 2) & 0b111);
+                }
             } else {
                 crash_and_burn("unsupported compressed instruction");
             }
         } else {
-            if (opcode != 0b0100011) crash_and_burn("unexpected access opcode");
+            switch (opcode) {
+                case 0b0100011: is_write = true;  break;
+                case 0b0000011: is_write = false; break;
+                default: {
+                    char msg[160];
+                    sprintf(msg, "Unexpected access opcode 0x%x at %p (PC=%p)", opcode, info->si_addr, pc_ptr);
+                    crash_and_burn(msg);
+                }
+            }
+
             uint32_t word = *static_cast<uint32_t*>(pc_ptr);
 
-            write_width = 1 << ((word >> 12) & 0b111);
+            width = 1 << ((word >> 12) & 0b111);
 
-            written_value = ctx->uc_mcontext.__gregs[(word >> 20) & 0b11111];
+            if (is_write) {
+                uint8_t reg = (word >> 20) & 0b11111;
+                value = reg ? ctx->uc_mcontext.__gregs[reg] : 0;
+            } else {
+                /* Actually just register idx */
+                value = (word >> 7) & 0b11111;
+            }
         }
 
-        if (addr == 0x278) {
+#ifdef ENABLE_FRAMEBUFFER
+        uint64_t write_dummy;
+        if (is_write && g_framebuffer.handle_write(addr, width, value)) {
+            ctx->uc_mcontext.__gregs[REG_PC] += (is_compressed ? 2 : 4);
+
+            /* Ignore writes to register 0, special case because the PC is stored at idx 0 */
+        } else if (!is_write && g_framebuffer.handle_read(addr, width, value ? ctx->uc_mcontext.__gregs[value] : write_dummy)) {
+            ctx->uc_mcontext.__gregs[REG_PC] += (is_compressed ? 2 : 4);
+        } else 
+#endif
+        if (is_write && addr == 0x278) {
             /* Controlled exit */
-            if (write_width != 1 && write_width != 4) crash_and_burn("unexpected write size for exit");
+            if (width != 1 && width != 4) crash_and_burn("unexpected write size for exit");
 
             std::copy_n(ctx->uc_mcontext.__gregs, NGREG, g_result_regs);
             ctx->uc_mcontext.__gregs[REG_PC] = reinterpret_cast<uintptr_t>(&safe_exit);
             ctx->uc_mcontext.__gregs[REG_A0] = ExitTypes::ExitByStatus;
-        } else if (addr == 0x200) {
+        } else if (is_write && addr == 0x200) {
             /* Serial 1-byte output */
-            if (write_width != 1) crash_and_burn("unexpected write size for serial");
+            if (width != 1) crash_and_burn("unexpected write size for serial");
 
-            char ch = written_value & 0xff;
+            char ch = value & 0xff;
 
             if (write(STDOUT_FILENO, &ch, 1) != 1) {
                 crash_and_burn("failed to write serial output");
@@ -246,8 +164,8 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
             /* Increment PC for when this handler returns */
             ctx->uc_mcontext.__gregs[REG_PC] += (is_compressed ? 2 : 4);
 
-        } else if (addr == 0x208) {
-            if (write_width != 8) crash_and_burn("unexpected write size for program start");
+        } else if (is_write && addr == 0x208) {
+            if (width != 8) crash_and_burn("unexpected write size for program start");
 
             /* Store a few important registers so we can restore them later */
             reg_storage[0] = 1;
@@ -256,7 +174,7 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
             reg_storage[3] = ctx->uc_mcontext.__gregs[REG_SP];
 
             /* Set PC */
-            ctx->uc_mcontext.__gregs[REG_PC] = written_value;
+            ctx->uc_mcontext.__gregs[REG_PC] = value;
 
             /* Load initial register values */
             /* Disable threading (set libthread-db-search-path /foo) for GDB to not when tp = 0 */
@@ -265,14 +183,16 @@ static void signal_handler(int sig, siginfo_t* info, void* ucontext) {
             /* Return context to program code with all registers set to 0 */
         } else {
             char msg[256];
-            sprintf(msg, "Unexpected write of %i to %p at %lx\n",
-                        static_cast<int>(write_width), info->si_addr, pc);
+            sprintf(msg, "Unexpected %s of %i to %p at %lx\n",
+                        is_write ? "write" : "read", static_cast<int>(width), info->si_addr, pc);
             crash_and_burn(msg);
         }
     }
 }
 
-static void bind_io(std::span<char> signal_stack) {
+static std::vector<safe_map> bind_io(std::span<char> signal_stack) {
+    std::vector<safe_map> res;
+
     /* Bind IO by mapping unwritable memory at specific addresses */
     /**
      * Map page 0 as nonwritable:
@@ -293,9 +213,28 @@ static void bind_io(std::span<char> signal_stack) {
         
         throw std::runtime_error(std::string("Mapping IO failed: ")
                 + strerrorname_np(errno) + " - " + strerror(errno));
-    } */
+    }
 
-    /* This only needs to be unmapped at exit, just leave it be */
+    res.emplace_back(map, page_size);
+
+    */
+
+#ifdef ENABLE_FRAMEBUFFER
+    void* fb_map = mmap(reinterpret_cast<void*>(fb_addr), fb_max_size,
+                        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE,
+                        -1, 0);
+
+    if (fb_map != reinterpret_cast<void*>(fb_addr)) {
+        if (fb_map != MAP_FAILED) {
+            munmap(fb_map, fb_max_size);
+        }
+        
+        throw std::runtime_error(std::string("Mapping framebuffer failed: ")
+                + strerrorname_np(errno) + " - " + strerror(errno));
+    }
+
+    res.emplace_back(fb_map, fb_max_size);
+#endif
 
     /* Run signal on separate stack, since we don't know whether the program has a stack at all */
     
@@ -327,6 +266,18 @@ static void bind_io(std::span<char> signal_stack) {
         throw std::runtime_error(std::string("Failed to set SIGILL handler: ")
                 + strerrorname_np(errno) + " - " + strerror(errno));
     }
+
+    return res;
+}
+
+void unbind_io() {
+    struct sigaction sig { };
+    sig.sa_flags = 0;
+    sig.sa_handler = SIG_DFL;
+    sigemptyset(&sig.sa_mask);
+
+    sigaction(SIGSEGV, &sig, nullptr);
+    sigaction(SIGILL, &sig, nullptr);
 }
 
 static void load_conf(const std::string& path, std::vector<reg_init>& pre, std::vector<reg_init>& post) {
@@ -389,7 +340,7 @@ static int run(const std::string& src, std::vector<reg_init> pre) {
         throw std::runtime_error("Unexpected page size");
     }
     
-    bind_io(signal_stack);
+    auto io_mappings = bind_io(signal_stack);
     
     std::fill_n(&g_init_regs[0], NGREG, 0);
     for (const reg_init& reg : pre) {
@@ -398,6 +349,10 @@ static int run(const std::string& src, std::vector<reg_init> pre) {
             g_init_regs[reg.num] = reg.val;
         }
     }
+
+#ifdef ENABLE_FRAMEBUFFER
+    std::jthread fb_thread { [](std::stop_token stop) { g_framebuffer.entry(stop); } };
+#endif
 
     std::chrono::high_resolution_clock::time_point begin;
     bool test_marker_encountered = false;
@@ -420,6 +375,13 @@ static int run(const std::string& src, std::vector<reg_init> pre) {
 
     auto elapsed = std::chrono::high_resolution_clock::now() - begin;
 
+    unbind_io();
+
+#ifdef ENABLE_FRAMEBUFFER
+    fb_thread.request_stop();
+    fb_thread.join();
+#endif
+
     if (!is_test) {
         if (test_marker_encountered) {
             std::cerr << "Test marker encountered at " << std::hex << g_result_regs[REG_PC] << std::endl;
@@ -427,7 +389,21 @@ static int run(const std::string& src, std::vector<reg_init> pre) {
             std::cerr << "System halt requested at " << std::hex << g_result_regs[REG_PC] << std::endl;
         }
 
-        std::cerr << "Took " << (elapsed.count() / 1e3) << " us" << std::endl;
+        auto ns = elapsed.count();
+
+        std::cerr << "Took ";
+        if (ns < 1e3) {
+            std::cerr << ns << " ns";
+        } else if (ns < 1e6) {
+            std::cerr << (ns / 1e3) << " us";
+        } else if (ns < 1e9) {
+            std::cerr << (ns / 1e6) << " ms";
+        } else {
+            std::cerr << (ns / 1e9) << " s";
+        }
+
+        std::cerr << std::endl;
+
         dump_regs(g_result_regs);
     }
 
