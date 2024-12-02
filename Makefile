@@ -34,3 +34,4 @@ rv64-ume: $(OBJECTS)
 clean:
 	rm -f rv64-ume
 	rm -f $(OBJECTS)
+	rm -f framebuffer.o
